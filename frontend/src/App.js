@@ -1,269 +1,388 @@
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 import { ethers } from "ethers";
-import ABI from "./ValueCentricABI.json";
+import contractABI from "./ValueCentricABI.json";
+import axios from "axios";
 
 const CONTRACT_ADDRESS = "0xb5D45863eBDECbD4305e04e7674F684a08A1CAac";
 const PINATA_API_KEY = "f7415f07fdfc68176fab";
-const PINATA_SECRET_KEY = "3712b48777ed913d1183a81624f75b0ab2cac82fa48f575c4b29c4d5d88782e7";
+const PINATA_SECRET_API_KEY = "3712b48777ed913d1183a81624f75b0ab2cac82fa48f575c4b29c4d5d88782e7";
 
 function App() {
-  const [account, setAccount] = useState(null);
+  const [account, setAccount] = useState("");
   const [contract, setContract] = useState(null);
+  const [status, setStatus] = useState("Idle");
+
   const [productId, setProductId] = useState("");
   const [serial, setSerial] = useState("");
   const [receiver, setReceiver] = useState("");
+  const [file, setFile] = useState(null);
+
+  const [fetchProductId, setFetchProductId] = useState("");
+  const [fetchSerial, setFetchSerial] = useState("");
   const [docs, setDocs] = useState([]);
-  const [status, setStatus] = useState({ msg: "", type: "" });
+  const [error, setError] = useState("");
 
-  useEffect(() => {
-    if (window.ethereum) {
-      window.ethereum.on("accountsChanged", (accounts) => {
-        if (accounts.length > 0) {
-          setAccount(accounts[0]);
-        } else {
-          setAccount(null);
-        }
-      });
-    }
-  }, []);
-
+  // ---------------- MetaMask ----------------
   async function connectWallet() {
-    if (!window.ethereum) return alert("Install MetaMask");
-    const provider = new ethers.BrowserProvider(window.ethereum);
-    await provider.send("eth_requestAccounts", []);
-    const signer = await provider.getSigner();
-    const addr = await signer.getAddress();
-    setAccount(addr);
-    const c = new ethers.Contract(CONTRACT_ADDRESS, ABI, signer);
-    setContract(c);
+    try {
+      setStatus("🔗 Connecting to MetaMask...");
+      if (window.ethereum) {
+        const provider = new ethers.BrowserProvider(window.ethereum);
+        await provider.send("eth_requestAccounts", []);
+        const signer = await provider.getSigner();
+        const addr = await signer.getAddress();
+
+        setAccount(addr);
+        const c = new ethers.Contract(CONTRACT_ADDRESS, contractABI, signer);
+        setContract(c);
+        setStatus("✅ Wallet Connected");
+      } else {
+        setError("Install MetaMask first!");
+        setStatus("❌ MetaMask not detected");
+      }
+    } catch (err) {
+      setStatus("❌ Failed to connect wallet");
+      setError(err.message);
+    }
   }
 
-  function showStatus(msg, type = "info") {
-    setStatus({ msg, type });
-  }
-
+  // ---------------- Product ----------------
   async function registerProduct() {
     try {
-      showStatus("⏳ Registering product...");
+      setStatus("🧾 Registering product...");
       const tx = await contract.registerProduct(productId, serial);
       await tx.wait();
-      showStatus("✅ Product registered successfully!", "success");
-    } catch (e) {
-      console.error(e);
-      showStatus("❌ Register failed: " + (e.data?.message || e.message), "error");
+      setError("");
+      setStatus("✅ Product Registered Successfully!");
+    } catch (err) {
+      console.error(err);
+      setError(err.reason || "Register failed");
+      setStatus("❌ Registration Failed");
     }
   }
 
   async function transferProduct() {
     try {
-      showStatus("⏳ Transferring product...");
+      setStatus("🚚 Transferring product...");
       const tx = await contract.transferProduct(productId, serial, receiver);
       await tx.wait();
-      showStatus("✅ Product transferred successfully!", "success");
-    } catch (e) {
-      console.error(e);
-      showStatus("❌ Transfer failed: " + (e.data?.message || e.message), "error");
+      setError("");
+      setStatus("✅ Product Transferred Successfully!");
+    } catch (err) {
+      console.error(err);
+      setError(err.reason || "Transfer failed");
+      setStatus("❌ Transfer Failed");
     }
   }
 
-  async function recordDocument(file) {
-    try {
-      showStatus("⏳ Uploading file to Pinata...");
-      const formData = new FormData();
-      formData.append("file", file);
+  // ---------------- Document Upload ----------------
+  const [uploadedCid, setUploadedCid] = useState(""); // add at top
 
-      const res = await fetch("https://api.pinata.cloud/pinning/pinFileToIPFS", {
-        method: "POST",
+async function uploadDocument() {
+  if (!productId || !serial) {
+    setError("⚠️ Enter both Product ID and Serial Number!");
+    return;
+  }
+
+  if (!file) {
+    setError("⚠️ Select a file first!");
+    return;
+  }
+
+  try {
+    setStatus("📤 Uploading document to IPFS...");
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const res = await axios.post(
+      "https://api.pinata.cloud/pinning/pinFileToIPFS",
+      formData,
+      {
         headers: {
           pinata_api_key: PINATA_API_KEY,
-          pinata_secret_api_key: PINATA_SECRET_KEY,
+          pinata_secret_api_key: PINATA_SECRET_API_KEY,
         },
-        body: formData,
-      });
+      }
+    );
 
-      const r = await res.json();
-      const cid = r.IpfsHash;
-      if (!cid) throw new Error("Pinata upload failed");
+    const cid = res.data.IpfsHash;
+    setUploadedCid(cid); // save CID to state
 
-      showStatus("📦 Uploaded to Pinata: " + cid + ". Recording on chain...");
+    const key = ethers.keccak256(
+      ethers.toUtf8Bytes(productId + "|" + serial)
+    );
 
-      const key = await contract.computeProductKey(productId, serial);
-      const docHash = ethers.keccak256(ethers.toUtf8Bytes(file.name));
+    setStatus("🔗 Recording document on blockchain...");
+    const tx = await contract.recordDocument(
+      key,
+      cid,
+      ethers.keccak256(ethers.toUtf8Bytes(cid))
+    );
+    await tx.wait();
 
-      const tx = await contract.recordDocument(key, cid, docHash);
-      await tx.wait();
-      showStatus("✅ Document recorded on blockchain!", "success");
-    } catch (e) {
-      console.error(e);
-      showStatus("❌ Upload/record failed: " + (e.data?.message || e.message), "error");
-    }
+    setError("");
+    setStatus("✅ Document Uploaded Successfully!");
+    alert("📄 Document Uploaded! CID: " + cid);
+  } catch (err) {
+    console.error(err);
+    setError(err.reason || "❌ Upload failed");
+    setStatus("❌ Document Upload Failed");
   }
+}
 
-  async function fetchDocs() {
+
+  // ---------------- Document Fetch ----------------
+  async function fetchDocuments() {
     try {
-      const key = await contract.computeProductKey(productId, serial);
+      setStatus("🔍 Fetching documents...");
+      const key = ethers.keccak256(
+        ethers.toUtf8Bytes(fetchProductId + "|" + fetchSerial)
+      );
+
       const count = await contract.getDocCount(key);
-      const n = Number(count);
-      const fetched = [];
-      for (let i = 0; i < n; i++) {
+      const docs = [];
+      for (let i = 0; i < count; i++) {
         const doc = await contract.getDocByIndex(key, i);
-        fetched.push({
+        docs.push({
           cid: doc[0],
+          cidHash: doc[1],
           uploader: doc[2],
-          timestamp: new Date(Number(doc[3]) * 1000).toLocaleString(),
+          timestamp: Number(doc[3]),
         });
       }
-      setDocs(fetched);
-      showStatus("📄 Loaded " + fetched.length + " documents", "success");
-    } catch (e) {
-      console.error(e);
-      showStatus("❌ Fetch failed: " + (e.data?.message || e.message), "error");
+      setDocs(docs);
+      setError("");
+      setStatus(`✅ Found ${docs.length} Document(s)`);
+    } catch (err) {
+      console.error(err);
+      setError(err.reason || err.message || "Fetch failed");
+      setStatus("❌ Failed to fetch documents");
     }
   }
 
+  // ---------------- Styles ----------------
   const cardStyle = {
-    background: "#fff",
-    padding: "20px",
-    marginBottom: "20px",
-    borderRadius: "10px",
-    boxShadow: "0 2px 6px rgba(0,0,0,0.1)",
+    backdropFilter: "blur(12px)",
+    background: "rgba(255, 255, 255, 0.15)",
+    padding: "25px",
+    margin: "25px auto",
+    width: "90%",
+    maxWidth: "480px",
+    borderRadius: "16px",
+    boxShadow: "0 4px 25px rgba(0, 0, 0, 0.2)",
+    color: "#fff",
+    textAlign: "center",
+    transition: "all 0.3s ease-in-out",
   };
 
-  const buttonStyle = (color) => ({
-    padding: "10px 15px",
-    marginTop: "10px",
-    background: color,
-    color: "#fff",
+  const inputStyle = {
+    padding: "10px",
+    margin: "8px",
+    borderRadius: "8px",
     border: "none",
-    borderRadius: "6px",
-    cursor: "pointer",
-  });
+    width: "85%",
+    maxWidth: "350px",
+    outline: "none",
+    background: "rgba(255,255,255,0.2)",
+    color: "#fff",
+  };
 
-  const statusColor = {
-    info: "#2980b9",
-    success: "#27ae60",
-    error: "#c0392b",
+  const buttonStyle = {
+    background: "linear-gradient(90deg, #0072ff, #00c6ff)",
+    color: "white",
+    border: "none",
+    padding: "10px 20px",
+    margin: "10px",
+    borderRadius: "10px",
+    cursor: "pointer",
+    fontWeight: "bold",
+    transition: "0.3s",
+  };
+
+  const statusBox = {
+    background: "rgba(255,255,255,0.2)",
+    color: "#fff",
+    padding: "15px",
+    borderRadius: "10px",
+    width: "80%",
+    maxWidth: "500px",
+    margin: "30px auto",
+    textAlign: "center",
+    fontWeight: "bold",
+    letterSpacing: "0.5px",
+    boxShadow: "0 4px 15px rgba(0,0,0,0.2)",
   };
 
   return (
-    <div style={{ maxWidth: "800px", margin: "0 auto", fontFamily: "Segoe UI, sans-serif", padding: "20px" }}>
-      <h1 style={{ textAlign: "center", color: "#2c3e50" }}>ValueCentric Supply Chain DApp</h1>
-      <p style={{ textAlign: "center", color: "#555" }}>
-        Blockchain + IPFS-powered traceability with role-based access control
+    <div
+      style={{
+        textAlign: "center",
+        padding: "40px 20px",
+        minHeight: "100vh",
+        background: "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
+        fontFamily: "'Poppins', sans-serif",
+      }}
+    >
+      <h1 style={{ color: "white", fontSize: "2.5rem", marginBottom: "10px" }}>
+        ValueCentric Supply Chain DApp
+      </h1>
+      <p style={{ color: "#e0e0e0", marginBottom: "25px" }}>
+        Secure • Transparent • Decentralized
       </p>
 
-      {!account ? (
-        <div style={{ textAlign: "center", margin: "20px" }}>
-          <button onClick={connectWallet} style={buttonStyle("#1f6feb")}>
-            🔗 Connect MetaMask
-          </button>
-        </div>
-      ) : (
-        <div style={{ textAlign: "center", margin: "10px", color: "#16a085" }}>
-          ✅ Connected: <b>{account}</b>
-        </div>
-      )}
+      <button style={buttonStyle} onClick={connectWallet}>
+        🔗 Connect MetaMask
+      </button>
+      <p style={{ color: "white" }}>
+        <b>Connected Account:</b> {account || "Not connected"}
+      </p>
+      {error && <p style={{ color: "#ffb3b3" }}>{error}</p>}
 
-      {/* Register Product */}
+      {/* Register */}
       <div style={cardStyle}>
-        <h2>📦 Register Product</h2>
-        <label>Product ID:</label>
+        <h2>🧾 Register Product</h2>
         <input
+          style={inputStyle}
           type="text"
+          placeholder="Product ID"
           value={productId}
           onChange={(e) => setProductId(e.target.value)}
-          style={{ width: "100%", padding: "8px", margin: "5px 0" }}
         />
-        <label>Serial Number:</label>
         <input
+          style={inputStyle}
           type="text"
+          placeholder="Serial"
           value={serial}
           onChange={(e) => setSerial(e.target.value)}
-          style={{ width: "100%", padding: "8px", margin: "5px 0" }}
         />
-        <button onClick={registerProduct} style={buttonStyle("#27ae60")}>
-          ✅ Register
+        <button style={buttonStyle} onClick={registerProduct}>
+          Register
         </button>
       </div>
 
-      {/* Transfer Product */}
-<div style={cardStyle}>
-  <h2>🔄 Transfer Product</h2>
-  
-  <label>Product ID:</label>
+      {/* Transfer */}
+      <div style={cardStyle}>
+        <h2>🚚 Transfer Product</h2>
+        <input
+          style={inputStyle}
+          type="text"
+          placeholder="Product ID"
+          value={productId}
+          onChange={(e) => setProductId(e.target.value)}
+        />
+        <input
+          style={inputStyle}
+          type="text"
+          placeholder="Serial"
+          value={serial}
+          onChange={(e) => setSerial(e.target.value)}
+        />
+        <input
+          style={inputStyle}
+          type="text"
+          placeholder="Receiver Address"
+          value={receiver}
+          onChange={(e) => setReceiver(e.target.value)}
+        />
+        <button style={buttonStyle} onClick={transferProduct}>
+          Transfer
+        </button>
+        
+      </div>
+
+      {/* Upload */}
+      <div style={cardStyle}>
+  <h2>📤 Upload Document</h2>
+
   <input
+    style={inputStyle}
     type="text"
+    placeholder="Product ID"
     value={productId}
     onChange={(e) => setProductId(e.target.value)}
-    style={{ width: "100%", padding: "8px", margin: "5px 0" }}
-    placeholder="Enter product ID"
   />
 
-  <label>Serial Number:</label>
   <input
+    style={inputStyle}
     type="text"
+    placeholder="Serial"
     value={serial}
     onChange={(e) => setSerial(e.target.value)}
-    style={{ width: "100%", padding: "8px", margin: "5px 0" }}
-    placeholder="Enter serial number"
   />
 
-  <label>Receiver Address:</label>
   <input
-    type="text"
-    value={receiver}
-    onChange={(e) => setReceiver(e.target.value)}
-    style={{ width: "100%", padding: "8px", margin: "5px 0" }}
-    placeholder="Enter receiver wallet address"
+    style={inputStyle}
+    type="file"
+    onChange={(e) => setFile(e.target.files[0])}
   />
 
-  <button onClick={transferProduct} style={buttonStyle("#f39c12")}>
-    🔄 Transfer
+  <button style={buttonStyle} onClick={uploadDocument}>
+    Upload
   </button>
 </div>
 
 
-      {/* Upload Document */}
-      <div style={cardStyle}>
-        <h2>📑 Upload Certificate</h2>
-        <input type="file" onChange={(e) => recordDocument(e.target.files[0])} />
-      </div>
 
-      {/* Fetch Documents */}
+      {/* Fetch */}
       <div style={cardStyle}>
-        <h2>📄 View Documents</h2>
-        <button onClick={fetchDocs} style={buttonStyle("#8e44ad")}>
-          🔍 Fetch Docs
+        <h2>📑 Fetch Documents</h2>
+        <input
+          style={inputStyle}
+          type="text"
+          placeholder="Product ID"
+          value={fetchProductId}
+          onChange={(e) => setFetchProductId(e.target.value)}
+        />
+        <input
+          style={inputStyle}
+          type="text"
+          placeholder="Serial"
+          value={fetchSerial}
+          onChange={(e) => setFetchSerial(e.target.value)}
+        />
+        <button style={buttonStyle} onClick={fetchDocuments}>
+          Fetch
         </button>
-        <ul>
-          {docs.map((d, i) => (
-            <li key={i} style={{ margin: "8px 0" }}>
-              <a href={`https://gateway.pinata.cloud/ipfs/${d.cid}`} target="_blank" rel="noreferrer">
-                {d.cid}
-              </a>{" "}
-              <br />
-              Uploaded by: {d.uploader} <br />
-              On: {d.timestamp}
-            </li>
-          ))}
-        </ul>
+
+        {docs.length > 0 && (
+          <div style={{ marginTop: "20px" }}>
+            <h3>📄 Documents Found:</h3>
+            <ul style={{ listStyle: "none", padding: 0 }}>
+              {docs.map((doc, i) => (
+                <li
+                  key={i}
+                  style={{
+                    background: "rgba(255, 255, 255, 0.1)",
+                    margin: "10px auto",
+                    padding: "12px",
+                    borderRadius: "10px",
+                    width: "90%",
+                    color: "#fff",
+                  }}
+                >
+                  <p><b>Uploader:</b> {doc.uploader}</p>
+                  <p>
+                    <b>Time:</b>{" "}
+                    {new Date(Number(doc.timestamp) * 1000).toLocaleString()}
+                  </p>
+                  <a
+  href={`https://maroon-important-prawn-698.mypinata.cloud/ipfs/${doc.cid}`}
+  target="_blank"
+  rel="noreferrer"
+>
+  🔗 View Document
+</a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
       </div>
 
-      {/* Status */}
-      {status.msg && (
-        <div
-          style={{
-            marginTop: "20px",
-            padding: "12px",
-            borderRadius: "6px",
-            background: statusColor[status.type] || "#2980b9",
-            color: "#fff",
-            textAlign: "center",
-          }}
-        >
-          {status.msg}
-        </div>
-      )}
+      {/* Status Panel */}
+      <div style={statusBox}>
+        <p>{status}</p>
+      </div>
     </div>
   );
 }
